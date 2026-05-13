@@ -1369,7 +1369,7 @@ def test_sdk_set_aliases_error_nonexistent(client: WeaveClient):
 # ---------------------------------------------------------------------------
 
 
-def test_weave_tag_functions(weave_active: WeaveClient):
+def test_weave_tag_functions(weave_active):
     """weave.add_tags, remove_tags, get_tags, list_tags — full lifecycle."""
     ref = weave.publish({"data": "test"}, name="tl_tags")
 
@@ -1566,7 +1566,7 @@ def test_alias_resolution(client: WeaveClient):
 # ---------------------------------------------------------------------------
 
 
-def test_full_lifecycle(weave_active: WeaveClient):
+def test_full_lifecycle(weave_active):
     """Comprehensive lifecycle: publish, tag, alias, resolve, reassign, remove, verify lists."""
     ref_v0 = weave.publish({"v": 0}, name="lifecycle_obj")
     ref_v1 = weave.publish({"v": 1}, name="lifecycle_obj")
@@ -1605,7 +1605,7 @@ def test_full_lifecycle(weave_active: WeaveClient):
     assert "reviewed" in all_tags
 
 
-def test_publish_with_tags_and_aliases(weave_active: WeaveClient):
+def test_publish_with_tags_and_aliases(weave_active):
     """Tags and aliases set at publish time work with resolution."""
     weave.publish({"v": 0}, name="pub_resolve")
     weave.publish(
