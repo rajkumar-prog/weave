@@ -29,9 +29,16 @@ from weave.trace_server.agents.schema import (
     AgentSpanCHInsertable,
 )
 from weave.trace_server.agents.types import (
+    AGENT_CUSTOM_ATTR_SOURCE_VALUE_TYPES,
     AgentConversationChatReq,
     AgentConversationChatRes,
+    AgentConversationCustomAttrDistributionBin,
+    AgentConversationCustomAttrDistributionItem,
+    AgentConversationCustomAttrDistributionsReq,
+    AgentConversationCustomAttrDistributionsRes,
+    AgentConversationCustomAttrDistributionValue,
     AgentCustomAttrSchemaItem,
+    AgentCustomAttrSource,
     AgentCustomAttrsSchemaReq,
     AgentCustomAttrsSchemaRes,
     AgentSchema,
@@ -68,11 +75,15 @@ from weave.trace_server.query_builder.agent_query_builder import (
     make_agents_list_query,
     make_conversation_chat_spans_query,
     make_conversation_chat_turns_count_query,
+    make_conversation_custom_attr_categorical_distribution_query,
+    make_conversation_custom_attr_distribution_counts_query,
+    make_conversation_custom_attr_numeric_distribution_query,
     make_custom_attrs_schema_query,
     make_message_search_query,
     make_spans_count_query,
     make_spans_list_query,
     make_trace_detail_spans_query,
+    safe_float,
     safe_int,
     safe_str,
 )
@@ -188,6 +199,82 @@ class AgentQueryHandler:
             limit=req.limit,
             offset=req.offset,
             has_more=len(rows) > req.limit,
+        )
+
+    def conversation_custom_attr_distributions(
+        self, req: AgentConversationCustomAttrDistributionsReq
+    ) -> AgentConversationCustomAttrDistributionsRes:
+        """Return compact custom attribute distributions for conversation rows."""
+        pb = ParamBuilder(PARAM_NAMESPACE)
+        counts_sql = make_conversation_custom_attr_distribution_counts_query(pb, req)
+        total_counts = {
+            safe_str(row.get("conversation_id")): safe_int(row.get("total_count"))
+            for row in _rows_as_dicts(self._query(counts_sql, pb.get_params()))
+        }
+        items: dict[tuple[str, str], AgentConversationCustomAttrDistributionItem] = {}
+        for conversation_id in req.conversation_ids:
+            for spec in req.attrs:
+                total_count = total_counts.get(conversation_id, 0)
+                source = cast(AgentCustomAttrSource, spec.value.source)
+                items[conversation_id, spec.alias] = (
+                    AgentConversationCustomAttrDistributionItem(
+                        conversation_id=conversation_id,
+                        alias=spec.alias,
+                        source=source,
+                        key=spec.value.key,
+                        value_type=AGENT_CUSTOM_ATTR_SOURCE_VALUE_TYPES[source],
+                        total_count=total_count,
+                        missing_count=total_count,
+                    )
+                )
+
+        for spec in req.attrs:
+            pb = ParamBuilder(PARAM_NAMESPACE)
+            if spec.value.source in {"custom_attrs_int", "custom_attrs_float"}:
+                sql = make_conversation_custom_attr_numeric_distribution_query(
+                    pb, req, spec
+                )
+                for row in _rows_as_dicts(self._query(sql, pb.get_params())):
+                    key = (safe_str(row.get("conversation_id")), spec.alias)
+                    item = items.get(key)
+                    if item is None:
+                        continue
+                    item.present_count = safe_int(row.get("present_count"))
+                    item.missing_count = max(0, item.total_count - item.present_count)
+                    item.bins.append(
+                        AgentConversationCustomAttrDistributionBin(
+                            index=safe_int(row.get("bucket_index")),
+                            min=safe_float(row.get("bucket_min")),
+                            max=safe_float(row.get("bucket_max")),
+                            count=safe_int(row.get("count")),
+                        )
+                    )
+                continue
+
+            sql = make_conversation_custom_attr_categorical_distribution_query(
+                pb, req, spec
+            )
+            for row in _rows_as_dicts(self._query(sql, pb.get_params())):
+                key = (safe_str(row.get("conversation_id")), spec.alias)
+                item = items.get(key)
+                if item is None:
+                    continue
+                item.present_count = safe_int(row.get("present_count"))
+                item.missing_count = max(0, item.total_count - item.present_count)
+                item.values.append(
+                    AgentConversationCustomAttrDistributionValue(
+                        value=safe_str(row.get("value")),
+                        count=safe_int(row.get("count")),
+                    )
+                )
+
+        for item in items.values():
+            if item.values:
+                top_count = sum(value.count for value in item.values)
+                item.other_count = max(0, item.present_count - top_count)
+
+        return AgentConversationCustomAttrDistributionsRes(
+            distributions=list(items.values())
         )
 
     # ------------------------------------------------------------------

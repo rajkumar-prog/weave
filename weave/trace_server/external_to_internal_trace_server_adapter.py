@@ -1199,6 +1199,16 @@ class ExternalTraceServer(tsi.FullTraceServerInterface):
             req.project_id,
         )
 
+    def agent_conversation_custom_attr_distributions(
+        self, req: tsi.agent_types.AgentConversationCustomAttrDistributionsReq
+    ) -> tsi.agent_types.AgentConversationCustomAttrDistributionsRes:
+        req.project_id = self._idc.ext_to_int_project_id(req.project_id)
+        return self._ref_apply(
+            self._internal_trace_server.agent_conversation_custom_attr_distributions,
+            req,
+            req.project_id,
+        )
+
     def agent_agents_query(
         self, req: tsi.agent_types.AgentsQueryReq
     ) -> tsi.agent_types.AgentsQueryRes:

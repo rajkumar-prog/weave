@@ -2926,6 +2926,9 @@ class TraceServerInterface(Protocol):
     def agent_custom_attrs_schema(
         self, req: agent_types.AgentCustomAttrsSchemaReq
     ) -> agent_types.AgentCustomAttrsSchemaRes: ...
+    def agent_conversation_custom_attr_distributions(
+        self, req: agent_types.AgentConversationCustomAttrDistributionsReq
+    ) -> agent_types.AgentConversationCustomAttrDistributionsRes: ...
     def agent_agents_query(
         self, req: agent_types.AgentsQueryReq
     ) -> agent_types.AgentsQueryRes: ...

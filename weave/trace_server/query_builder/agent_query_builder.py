@@ -25,6 +25,8 @@ from weave.trace_server.agents.constants import (
 from weave.trace_server.agents.types import (
     AGENT_CUSTOM_ATTR_SOURCE_VALUE_TYPES,
     AgentConversationChatReq,
+    AgentConversationCustomAttrDistributionSpec,
+    AgentConversationCustomAttrDistributionsReq,
     AgentCustomAttrsSchemaReq,
     AgentGroupByRef,
     AgentSearchReq,
@@ -94,6 +96,17 @@ SPAN_GROUP_AGGREGATE_COLS: frozenset[str] = frozenset(
         "first_seen",
         "last_seen",
     }
+)
+SPAN_GROUP_RESULT_COLS: frozenset[str] = SPAN_GROUP_AGGREGATE_COLS.union(
+    frozenset(
+        {
+            "agent_names",
+            "agent_versions",
+            "provider_names",
+            "request_models",
+            "conversation_names",
+        }
+    )
 )
 
 SPAN_SORTABLE_COLS: frozenset[str] = SPAN_FILTERABLE_COLS.union(
@@ -710,6 +723,20 @@ def ensure_group_filters_match(
             )
 
 
+def ensure_group_measure_aliases_do_not_collide(
+    group_aliases: list[str], measures: list[AgentSpanMeasureSpec]
+) -> None:
+    """Reject dynamic measure aliases that would overwrite grouped row fields."""
+    reserved = SPAN_GROUP_RESULT_COLS.union(frozenset(group_aliases))
+    collisions = sorted(
+        {measure.alias for measure in measures if measure.alias in reserved}
+    )
+    if collisions:
+        raise ValueError(
+            f"measure aliases collide with grouped row fields: {collisions!r}"
+        )
+
+
 def group_filters_having_sql(
     pb: ParamBuilder,
     filters: list[AgentSpanGroupFilter],
@@ -762,7 +789,12 @@ def _and_conditions(*conditions: str) -> str:
 
 
 def _spans_filter_sql(
-    pb: ParamBuilder, req: AgentSpansQueryReq | AgentCustomAttrsSchemaReq
+    pb: ParamBuilder,
+    req: (
+        AgentSpansQueryReq
+        | AgentCustomAttrsSchemaReq
+        | AgentConversationCustomAttrDistributionsReq
+    ),
 ) -> _FilterSQL:
     pid_slot = pb.add(req.project_id, param_type="String")
     where_conditions = [_project_filter_sql("s.project_id", pid_slot)]
@@ -870,6 +902,8 @@ def make_spans_count_query(pb: ParamBuilder, req: AgentSpansQueryReq) -> str:
     if not req.group_by:
         return f"SELECT count() FROM spans s WHERE {span_filters.where}"
     resolved = resolve_group_by(pb, req.group_by)
+    aliases = [alias for _, alias in resolved]
+    ensure_group_measure_aliases_do_not_collide(aliases, req.measures)
     group_exprs = ", ".join(expr for expr, _ in resolved)
     group_filters = span_group_filters(
         req.group_filters,
@@ -913,21 +947,21 @@ def make_spans_list_query(pb: ParamBuilder, req: AgentSpansQueryReq) -> str:
 
     resolved = resolve_group_by(pb, req.group_by)
     aliases = [a for _, a in resolved]
+    ensure_group_measure_aliases_do_not_collide(aliases, req.measures)
     select_group_cols = ", ".join(f"{expr} AS {alias}" for expr, alias in resolved)
     group_by_clause = ", ".join(aliases)
 
     measure_sqls = [span_measure_sql(measure, pb) for measure in req.measures]
-    aggregate_selects = (
-        ",\n               ".join(
-            f"{measure.aggregate_sql} AS {measure.alias}" for measure in measure_sqls
-        )
-        if measure_sqls
-        else _GROUPED_SPAN_AGGREGATES
+    dynamic_aggregate_selects = ",\n               ".join(
+        f"{measure.aggregate_sql} AS {measure.alias}" for measure in measure_sqls
     )
-    sortable = (
-        frozenset(aliases).union(measure.alias for measure in measure_sqls)
-        if measure_sqls
-        else SPAN_GROUP_AGGREGATE_COLS.union(frozenset(aliases))
+    aggregate_selects = _GROUPED_SPAN_AGGREGATES
+    if dynamic_aggregate_selects:
+        aggregate_selects = (
+            f"{aggregate_selects},\n               {dynamic_aggregate_selects}"
+        )
+    sortable = SPAN_GROUP_AGGREGATE_COLS.union(frozenset(aliases)).union(
+        measure.alias for measure in measure_sqls
     )
     default_order_by = (
         f"{measure_sqls[0].alias} DESC" if measure_sqls else "last_seen DESC"
@@ -988,6 +1022,155 @@ def make_custom_attrs_schema_query(
         GROUP BY source, key, value_type
         ORDER BY span_count DESC, key ASC, source ASC
         LIMIT {limit_slot} OFFSET {offset_slot}
+    """
+
+
+def make_conversation_custom_attr_distribution_counts_query(
+    pb: ParamBuilder, req: AgentConversationCustomAttrDistributionsReq
+) -> str:
+    """Count filtered spans per requested conversation."""
+    span_filters = _spans_filter_sql(pb, req)
+    conversation_ids_slot = pb.add(req.conversation_ids, param_type="Array(String)")
+    return f"""
+        SELECT s.conversation_id AS conversation_id,
+               count() AS total_count
+        FROM spans s
+        WHERE {span_filters.where}
+          AND s.conversation_id IN {conversation_ids_slot}
+        GROUP BY s.conversation_id
+    """
+
+
+def make_conversation_custom_attr_numeric_distribution_query(
+    pb: ParamBuilder,
+    req: AgentConversationCustomAttrDistributionsReq,
+    spec: AgentConversationCustomAttrDistributionSpec,
+) -> str:
+    """Build per-conversation histograms for one numeric custom attribute."""
+    span_filters = _spans_filter_sql(pb, req)
+    conversation_ids_slot = pb.add(req.conversation_ids, param_type="Array(String)")
+    key_slot = pb.add(spec.value.key, param_type="String")
+    bins_slot = pb.add(spec.bins, param_type="UInt64")
+    source = spec.value.source
+    value_sql = f"toFloat64(s.{source}[{key_slot}])"
+    bucket_width_sql = (
+        "if(bounds.max_value > bounds.min_value, "
+        f"(bounds.max_value - bounds.min_value) / toFloat64({bins_slot}), 1.0)"
+    )
+    bucket_index_sql = (
+        "if(bounds.max_value = bounds.min_value, toUInt64(0), "
+        f"toUInt64(least(toFloat64({bins_slot}) - 1.0, floor("
+        f"(value_rows.value - bounds.min_value) / {bucket_width_sql}))))"
+    )
+    bucket_min_sql = (
+        "if(bounds.max_value = bounds.min_value, bounds.min_value, "
+        f"bounds.min_value + toFloat64(all_buckets.bucket_index) * "
+        f"{bucket_width_sql})"
+    )
+    bucket_max_sql = (
+        "if(bounds.max_value = bounds.min_value, bounds.max_value, "
+        f"if(all_buckets.bucket_index = {bins_slot} - toUInt64(1), "
+        "bounds.max_value, "
+        "bounds.min_value + toFloat64(all_buckets.bucket_index + 1) * "
+        f"{bucket_width_sql}))"
+    )
+    return f"""
+        WITH
+          value_rows AS (
+            SELECT s.conversation_id AS conversation_id,
+                   {value_sql} AS value
+            FROM spans s
+            WHERE {span_filters.where}
+              AND s.conversation_id IN {conversation_ids_slot}
+              AND mapContains(s.{source}, {key_slot})
+              AND isNotNull({value_sql})
+              AND isFinite({value_sql})
+          ),
+          bounds AS (
+            SELECT conversation_id,
+                   min(value) AS min_value,
+                   max(value) AS max_value,
+                   count() AS present_count
+            FROM value_rows
+            GROUP BY conversation_id
+          ),
+          all_buckets AS (
+            SELECT toUInt64(number) AS bucket_index
+            FROM numbers({bins_slot})
+          ),
+          aggregated AS (
+            SELECT value_rows.conversation_id AS conversation_id,
+                   {bucket_index_sql} AS bucket_index,
+                   count() AS bin_count
+            FROM value_rows
+            INNER JOIN bounds ON value_rows.conversation_id = bounds.conversation_id
+            GROUP BY conversation_id, bucket_index
+          )
+        SELECT bounds.conversation_id AS conversation_id,
+               all_buckets.bucket_index AS bucket_index,
+               {bucket_min_sql} AS bucket_min,
+               {bucket_max_sql} AS bucket_max,
+               ifNull(aggregated.bin_count, 0) AS count,
+               bounds.present_count AS present_count
+        FROM bounds
+        CROSS JOIN all_buckets
+        LEFT JOIN aggregated
+          ON aggregated.conversation_id = bounds.conversation_id
+         AND aggregated.bucket_index = all_buckets.bucket_index
+        WHERE bounds.present_count > 0
+          AND (
+            bounds.max_value > bounds.min_value
+            OR all_buckets.bucket_index = 0
+          )
+        ORDER BY conversation_id ASC, bucket_index ASC
+    """
+
+
+def make_conversation_custom_attr_categorical_distribution_query(
+    pb: ParamBuilder,
+    req: AgentConversationCustomAttrDistributionsReq,
+    spec: AgentConversationCustomAttrDistributionSpec,
+) -> str:
+    """Build per-conversation top value counts for one categorical custom attr."""
+    span_filters = _spans_filter_sql(pb, req)
+    conversation_ids_slot = pb.add(req.conversation_ids, param_type="Array(String)")
+    key_slot = pb.add(spec.value.key, param_type="String")
+    top_n_slot = pb.add(spec.top_n, param_type="UInt64")
+    source = spec.value.source
+    if source == _SOURCE_CUSTOM_ATTRS_BOOL:
+        value_sql = f"if(s.{source}[{key_slot}] = 1, 'true', 'false')"
+    else:
+        value_sql = f"toString(s.{source}[{key_slot}])"
+    return f"""
+        WITH
+          value_counts AS (
+            SELECT s.conversation_id AS conversation_id,
+                   {value_sql} AS raw_value,
+                   count() AS value_count
+            FROM spans s
+            WHERE {span_filters.where}
+              AND s.conversation_id IN {conversation_ids_slot}
+              AND mapContains(s.{source}, {key_slot})
+            GROUP BY conversation_id, raw_value
+          ),
+          ranked AS (
+            SELECT conversation_id,
+                   raw_value,
+                   value_count,
+                   sum(value_count) OVER (PARTITION BY conversation_id) AS present_count,
+                   row_number() OVER (
+                     PARTITION BY conversation_id
+                     ORDER BY value_count DESC, raw_value ASC
+                   ) AS value_rank
+            FROM value_counts
+          )
+        SELECT conversation_id,
+               substring(raw_value, 1, 256) AS value,
+               value_count AS count,
+               present_count
+        FROM ranked
+        WHERE value_rank <= {top_n_slot}
+        ORDER BY conversation_id ASC, count DESC, raw_value ASC
     """
 
 

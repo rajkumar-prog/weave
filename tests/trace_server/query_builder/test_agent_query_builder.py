@@ -511,6 +511,7 @@ class TestMakeGroupedSpansListQuery:
 
         expected = """
             SELECT s.conversation_id AS conversation_id,
+                   {_GROUPED_AGG_TAIL},
                    count() AS spans,
                    countIf(((s.operation_name = {genai_3:String}))) AS tool_calls,
                    avgOrNull(if((mapContains(s.custom_attrs_float, {genai_4:String})), toFloat64(s.custom_attrs_float[{genai_4:String}]), NULL)) AS avg_score
@@ -521,6 +522,7 @@ class TestMakeGroupedSpansListQuery:
             ORDER BY avg_score desc
             LIMIT {genai_1:UInt64} OFFSET {genai_2:UInt64}
         """
+        expected = expected.replace("{_GROUPED_AGG_TAIL}", _GROUPED_AGG_TAIL)
         expected_params = {
             "genai_0": "p1",
             "genai_1": 100,
@@ -575,6 +577,7 @@ class TestMakeGroupedSpansListQuery:
 
         expected = """
             SELECT s.conversation_id AS conversation_id,
+                   {_GROUPED_AGG_TAIL},
                    countIf((mapContains(s.custom_attrs_bool, {genai_3:String})) AND s.custom_attrs_bool[{genai_3:String}] = 1) AS flagged_count
             FROM spans s
             WHERE s.project_id = {genai_0:String}
@@ -582,6 +585,7 @@ class TestMakeGroupedSpansListQuery:
             ORDER BY flagged_count DESC
             LIMIT {genai_1:UInt64} OFFSET {genai_2:UInt64}
         """
+        expected = expected.replace("{_GROUPED_AGG_TAIL}", _GROUPED_AGG_TAIL)
         expected_params = {
             "genai_0": "p1",
             "genai_1": 100,
@@ -589,6 +593,49 @@ class TestMakeGroupedSpansListQuery:
             "genai_3": "flagged",
         }
         assert_sql(expected, expected_params, query, pb.get_params())
+
+    def test_dynamic_measure_rejects_fixed_field_alias_collision(self) -> None:
+        pb = ParamBuilder("genai")
+        with pytest.raises(
+            ValueError,
+            match="measure aliases collide with grouped row fields: \\['span_count'\\]",
+        ):
+            make_spans_list_query(
+                pb,
+                AgentSpansQueryReq(
+                    project_id="p1",
+                    group_by=[AgentGroupByRef(source="column", key="conversation_id")],
+                    measures=[
+                        AgentSpanMeasureSpec(
+                            alias="span_count",
+                            aggregation="count",
+                        )
+                    ],
+                ),
+            )
+
+    def test_dynamic_measure_rejects_group_key_alias_collision(self) -> None:
+        pb = ParamBuilder("genai")
+        with pytest.raises(
+            ValueError,
+            match=(
+                "measure aliases collide with grouped row fields: "
+                "\\['conversation_id'\\]"
+            ),
+        ):
+            make_spans_count_query(
+                pb,
+                AgentSpansQueryReq(
+                    project_id="p1",
+                    group_by=[AgentGroupByRef(source="column", key="conversation_id")],
+                    measures=[
+                        AgentSpanMeasureSpec(
+                            alias="conversation_id",
+                            aggregation="count",
+                        )
+                    ],
+                ),
+            )
 
     def test_group_filter_rejects_mismatched_datetime_bound(self) -> None:
         pb = ParamBuilder("genai")

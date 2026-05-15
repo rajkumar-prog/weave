@@ -17,6 +17,10 @@ from weave.trace_server.agents.constants import (
     DEFAULT_AGENT_QUERY_LIMIT,
     DEFAULT_AGENT_STATS_GROUP_LIMIT,
     DEFAULT_SEARCH_LIMIT,
+    MAX_AGENT_CUSTOM_ATTR_DISTRIBUTION_BINS,
+    MAX_AGENT_CUSTOM_ATTR_DISTRIBUTION_CONVERSATIONS,
+    MAX_AGENT_CUSTOM_ATTR_DISTRIBUTION_SPECS,
+    MAX_AGENT_CUSTOM_ATTR_DISTRIBUTION_TOP_N,
     MAX_AGENT_CUSTOM_ATTR_SCHEMA_LIMIT,
     MAX_AGENT_QUERY_LIMIT,
     MAX_AGENT_STATS_GROUP_LIMIT,
@@ -616,6 +620,93 @@ class AgentCustomAttrsSchemaRes(BaseModel):
     limit: int = DEFAULT_AGENT_CUSTOM_ATTR_SCHEMA_LIMIT
     offset: int = 0
     has_more: bool = False
+
+
+class AgentConversationCustomAttrDistributionSpec(BaseModel):
+    """One custom attribute distribution to compute per conversation."""
+
+    alias: str = Field(pattern=_IDENT_RE)
+    value: AgentSpanValueRef
+    bins: int = Field(default=12, ge=1, le=MAX_AGENT_CUSTOM_ATTR_DISTRIBUTION_BINS)
+    top_n: int = Field(default=5, ge=1, le=MAX_AGENT_CUSTOM_ATTR_DISTRIBUTION_TOP_N)
+
+    @model_validator(mode="after")
+    def validate_distribution_spec(
+        self,
+    ) -> AgentConversationCustomAttrDistributionSpec:
+        if self.value.source not in AGENT_CUSTOM_ATTR_SOURCES:
+            raise ValueError("distribution specs must reference custom attr sources")
+        return self
+
+
+class AgentConversationCustomAttrDistributionBin(BaseModel):
+    """One numeric histogram bin for a custom attribute in a conversation."""
+
+    index: int
+    min: float
+    max: float
+    count: int
+
+
+class AgentConversationCustomAttrDistributionValue(BaseModel):
+    """One categorical custom attribute value count in a conversation."""
+
+    value: str
+    count: int
+
+
+class AgentConversationCustomAttrDistributionItem(BaseModel):
+    """Distribution data for one conversation/custom-attribute pair."""
+
+    conversation_id: str
+    alias: str
+    source: AgentCustomAttrSource
+    key: str
+    value_type: AgentCustomAttrValueType
+    total_count: int = 0
+    present_count: int = 0
+    missing_count: int = 0
+    other_count: int = 0
+    bins: list[AgentConversationCustomAttrDistributionBin] = Field(default_factory=list)
+    values: list[AgentConversationCustomAttrDistributionValue] = Field(
+        default_factory=list
+    )
+
+
+class AgentConversationCustomAttrDistributionsReq(BaseModel):
+    """Batch custom attribute distributions for the visible conversation rows."""
+
+    project_id: str
+    query: Query | None = None
+    conversation_ids: list[str] = Field(
+        min_length=1, max_length=MAX_AGENT_CUSTOM_ATTR_DISTRIBUTION_CONVERSATIONS
+    )
+    attrs: list[AgentConversationCustomAttrDistributionSpec] = Field(
+        min_length=1, max_length=MAX_AGENT_CUSTOM_ATTR_DISTRIBUTION_SPECS
+    )
+    started_after: datetime.datetime | None = None
+    started_before: datetime.datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_distribution_request(
+        self,
+    ) -> AgentConversationCustomAttrDistributionsReq:
+        self.conversation_ids = list(dict.fromkeys(self.conversation_ids))
+        aliases = [attr.alias for attr in self.attrs]
+        duplicate_aliases = sorted(
+            {alias for alias in aliases if aliases.count(alias) > 1}
+        )
+        if duplicate_aliases:
+            raise ValueError(f"duplicate distribution aliases: {duplicate_aliases!r}")
+        return self
+
+
+class AgentConversationCustomAttrDistributionsRes(BaseModel):
+    """Batched custom attribute distributions keyed by conversation and alias."""
+
+    distributions: list[AgentConversationCustomAttrDistributionItem] = Field(
+        default_factory=list
+    )
 
 
 # ---------------------------------------------------------------------------
